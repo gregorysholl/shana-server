@@ -1,57 +1,90 @@
-const admin = require("firebase-admin");
-const serviceAccount = require("./shana-app-firebase-adminsdk-6cdd8-60d0177d7b.json");
-
 const express = require('express')
 const bodyParser = require('body-parser')
-const mongoUtil = require('./utils/mongoUtil.js');
+
+const notification = require('./notification.js');
+const database = require('./database.js');
+const util = require('./utils/util.js');
+
+const httpRequest = require('request')
+const xmlParser = require('xml-js')
 
 const port = process.env.PORT || 3000
 const app = express()
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: "https://shana-app.firebaseio.com"
-});
-
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
-app.post('/register', function (request, response) {
-  console.log(request.body);
-  registerInformation(request.body, (error) => {
-    console.log(error);
-    response.send('Hello World!');
-  })
-})
+app.post('/register', (request, response) => handleRegister(request.body, response));
 
-const registerInformation = (body, callback) => {
-  const token = body.token;
-  const db = mongoUtil.getDb();
-  db.collection('users').findOne({token: token}, (error, result) => {
-    if (error || result == null) {
-      db.collection('users').insertOne(body, (error, result) => {
-        return callback(error);
-      })
-    } else {
-      db.collection('users').updateOne({token: token}, {$set: body}, (error, result) => {
-        return callback(error);
-      })
+const handleRegister = (body, response) => {
+  checkUrl(body.url, (error, titles) => {
+    const user = Object.assign(body, {titles: titles})
+    database.registerUser(user, (error, result) => {
+      if (error) {
+        console.log(`${error.name}: ${error.message}`);
+        return response.send({error: `${error.name}: ${error.message}`});
+      }
+      return response.send({status: true});
+    });
+  });
+}
+
+const checkUrl = (url, callback) => {
+  httpRequest(url, (error, response, body) => {
+    if (!error) {
+      const jsonString = xmlParser.xml2json(body, {compact: false, spaces: 4});
+      const json = JSON.parse(jsonString);
+      const listOfTitleObjects = util.getIn(json, ['elements', 'rss', 'elements', 'channel', 'elements'])
+                                      .filter((el) => el.name == 'item')
+                                      .map((el) => util.getIn(el, ['elements', 'title', 'elements']))
+
+      const regex = /.*\ -\ [0-9]+/;
+      const titles = util.flatten(listOfTitleObjects).map((el) => el.text);
+      const formattedTitles = titles.map((el) => {
+        const match = el.match(regex);
+        return match ? match[0] : el;
+      });
+      callback(null, formattedTitles);
     }
   })
+}
+
+const checkForNotifications = () => {
+  database.getAllUsers((error, users) => {
+    if (users.length == 0) {
+      return;
+    }
+    users.forEach((user, index) => {
+      checkUrl(user.url, (error, titles) => {
+        const newTitles = util.diff(titles, user.titles);
+        if (newTitles.length > 0) {
+          const message = newTitles.length > 1 ? `${newTitles.length} new episodes available!` : `${newTitles[0]} available!`;
+          notification.sendNotification(user.token, message);
+        }
+
+        const newUser = Object.assign(user, {titles: titles});
+        database.registerUser(newUser, (error, result) => {
+          if (error) {
+            console.log(error);
+          }
+        })
+      })
+    })
+  });
 }
 
 mongoUtil.connectToServer((err) => {
   if (err) {
     console.log('Unable to connect to the mongoDB server. Error: ', err)
   } else {
-    //só inicia o servidor caso consiga connectar ao banco de dados primeiro
-    registerInformation({token: "token2", url: "http://new", platform: "server++"}, (error) => {
-      console.log(error);
+    notification.connectToFCM();
+
+    app.listen(port, function () {
+      console.log('Example app listening on port 3000!')
     })
 
-    // app.listen(port, function () {
-    //   console.log('Example app listening on port 3000!')
-    // })
+    checkForNotifications();
+    // const mainLoop = setInterval(checkForNotifications, 2 * 60 * 60 * 1000)
   }
 })
 
@@ -60,22 +93,3 @@ mongoUtil.connectToServer((err) => {
 
 // // See the "Defining the message payload" section below for details
 // // on how to define a message payload.
-// var payload = {
-//   notification : {
-//     body : "great match!",
-//     title : "Portugal vs. Denmark",
-//     icon : "myicon"
-//   }
-// };
-//
-// // Send a message to the device corresponding to the provided
-// // registration token.
-// admin.messaging().sendToDevice(registrationToken, payload)
-//   .then(function(response) {
-//     // See the MessagingDevicesResponse reference documentation for
-//     // the contents of response.
-//     console.log("Successfully sent message:", response);
-//   })
-//   .catch(function(error) {
-//     console.log("Error sending message:", error);
-//   });
